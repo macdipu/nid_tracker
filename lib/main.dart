@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -10,7 +11,6 @@ import 'package:ultralytics_yolo/yolo_task.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import 'package:ultralytics_yolo/yolo_streaming_config.dart';
 import 'package:image/image.dart' as img;
-import 'package:gal/gal.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -725,39 +725,90 @@ class _NidCaptureYoloViewPageState extends State<NidCaptureYoloViewPage> {
       final ui.Image image = await boundary.toImage(pixelRatio: dpr);
       final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
       if (byteData == null) throw Exception('No image bytes');
-      var bytes = byteData.buffer.asUint8List();
+      Uint8List bytes = byteData.buffer.asUint8List();
 
       final cardLabel = _labels.firstWhere(
-            (l) => l.toLowerCase().contains('_image'),
+            (l) => l.toLowerCase().contains('_image') || l.toLowerCase().contains('card'),
         orElse: () => '',
       );
       if (cardLabel.isNotEmpty && _latestByLabel[cardLabel] != null) {
         final r = _latestByLabel[cardLabel]!;
         final nb = r.normalizedBox;
-        final imgDecoded = img.decodeImage(bytes);
-        if (imgDecoded != null) {
-          final iw = imgDecoded.width;
-          final ih = imgDecoded.height;
+        final decoded = img.decodeImage(bytes);
+        if (decoded != null) {
+          final iw = decoded.width;
+          final ih = decoded.height;
           final x = (nb.left * iw).clamp(0, iw - 1).toInt();
           final y = (nb.top * ih).clamp(0, ih - 1).toInt();
           final w = (nb.width * iw).clamp(1, iw - x).toInt();
           final h = (nb.height * ih).clamp(1, ih - y).toInt();
-          final cropped = img.copyCrop(imgDecoded, x: x, y: y, width: w, height: h);
-          bytes = img.encodePng(cropped);
+          final cropped = img.copyCrop(decoded, x: x, y: y, width: w, height: h);
+          bytes = Uint8List.fromList(img.encodePng(cropped));
         }
       }
 
-      final dir = await getTemporaryDirectory();
       final side = widget.labelsAssetPath.contains('back') ? 'back' : 'front';
-      final file = File('${dir.path}/nid_${side}_${DateTime.now().millisecondsSinceEpoch}.png');
-      await file.writeAsBytes(bytes);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved: ${file.path}')));
+      await _showPreviewAndMaybeSave(bytes: bytes, filePrefix: 'nid_$side');
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Capture failed: $e')));
     } finally {
       if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _showPreviewAndMaybeSave({required Uint8List bytes, required String filePrefix}) async {
+    if (!mounted) return;
+    final saved = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.black87,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Preview', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.memory(bytes, fit: BoxFit.contain),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(ctx, false),
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton(
+                        onPressed: () => Navigator.pop(ctx, true),
+                        child: const Text('Save'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (saved == true) {
+      final dir = await getTemporaryDirectory();
+      final out = File('${dir.path}/${filePrefix}_${DateTime.now().millisecondsSinceEpoch}.png');
+      await out.writeAsBytes(bytes);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved: ${out.path}')));
     }
   }
 }
@@ -798,3 +849,5 @@ class _BoxesOnlyPainter extends CustomPainter {
   bool shouldRepaint(covariant _BoxesOnlyPainter oldDelegate) =>
       oldDelegate.results != results || oldDelegate.drawLabels != drawLabels || oldDelegate.screenSize != screenSize;
 }
+
+
