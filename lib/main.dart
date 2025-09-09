@@ -1,12 +1,15 @@
 import 'dart:math' as math;
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter/rendering.dart';
 import 'package:ultralytics_yolo/yolo_result.dart';
 import 'package:ultralytics_yolo/yolo_task.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import 'package:ultralytics_yolo/yolo_streaming_config.dart';
+import 'package:image/image.dart' as img;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,6 +35,53 @@ class MyApp extends StatelessWidget {
 
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
+
+  void _openSidePicker(BuildContext context, {required bool boxesOnly}) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.credit_card),
+              title: const Text('Front side'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => NidCapturePage(
+                      title: boxesOnly ? 'Front - Boxes Only' : 'Front - Capture',
+                      modelAssetPath: 'assets/front_nid_model.tflite',
+                      labelsAssetPath: 'assets/front_nid_labels.txt',
+                      showBoxesOnly: boxesOnly,
+                    ),
+                  ),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.credit_card_rounded),
+              title: const Text('Back side'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => NidCapturePage(
+                      title: boxesOnly ? 'Back - Boxes Only' : 'Back - Capture',
+                      modelAssetPath: 'assets/back_nid_model.tflite',
+                      labelsAssetPath: 'assets/back_nid_labels.txt',
+                      showBoxesOnly: boxesOnly,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -72,12 +122,29 @@ class HomePage extends StatelessWidget {
                         builder: (_) => const NidLiveDetectPage(
                           title: 'NID Back - Live Detection',
                           modelAssetPath: 'assets/back_nid_model.tflite',
-                          labelsAssetPath: 'assets/front_nid_labels.txt',
+                          labelsAssetPath: 'assets/back_nid_labels.txt',
                         ),
                       ),
                     );
                   },
                   child: const Text('Open NID Back Detector'),
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: 280,
+                child: FilledButton.tonal(
+                  onPressed: () => _openSidePicker(context, boxesOnly: false),
+                  child: const Text('Use Camera'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: 280,
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.view_compact_alt),
+                  onPressed: () => _openSidePicker(context, boxesOnly: true),
+                  label: const Text('Show Bounding Box'),
                 ),
               ),
             ],
@@ -456,4 +523,277 @@ class _StatusBanner extends StatelessWidget {
       ),
     );
   }
+}
+
+// New: Capture Page for camera usage and capture logic
+class NidCapturePage extends StatefulWidget {
+  final String title;
+  final String modelAssetPath;
+  final String labelsAssetPath;
+  final bool showBoxesOnly;
+  const NidCapturePage({
+    super.key,
+    required this.title,
+    required this.modelAssetPath,
+    required this.labelsAssetPath,
+    this.showBoxesOnly = false,
+  });
+
+  @override
+  State<NidCapturePage> createState() => _NidCapturePageState();
+}
+
+class _NidCapturePageState extends State<NidCapturePage> {
+  final _controller = YOLOViewController();
+  final _boundaryKey = GlobalKey();
+
+  String? _modelFilePath;
+  List<String> _labels = const [];
+  bool _labelsLoaded = false;
+
+  List<YOLOResult> _results = const [];
+  Map<String, YOLOResult> _latestByLabel = {};
+  double? _fps;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepareModelPath();
+    _loadLabels();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _controller.setThresholds(confidenceThreshold: 0.60, iouThreshold: 0.50, numItemsThreshold: 100);
+    });
+  }
+
+  Future<void> _prepareModelPath() async {
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final modelsDir = Directory('${dir.path}/models');
+      if (!await modelsDir.exists()) await modelsDir.create(recursive: true);
+      final baseName = widget.modelAssetPath.split('/').last;
+      final outFile = File('${modelsDir.path}/$baseName');
+      final data = await rootBundle.load(widget.modelAssetPath);
+      if (!await outFile.exists() || (await outFile.length()) != data.lengthInBytes) {
+        await outFile.writeAsBytes(data.buffer.asUint8List(), flush: true);
+      }
+      if (mounted) setState(() => _modelFilePath = outFile.path);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Model copy failed: $e')));
+    }
+  }
+
+  Future<void> _loadLabels() async {
+    try {
+      final txt = await rootBundle.loadString(widget.labelsAssetPath);
+      final lines = txt.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
+      if (mounted) setState(() { _labels = lines; _labelsLoaded = true; });
+    } catch (_) {}
+  }
+
+  String _displayName(YOLOResult r) {
+    final name = r.className.trim();
+    final looksNumeric = RegExp(r'^\d+$').hasMatch(name);
+    if (_labelsLoaded && (name.isEmpty || looksNumeric) && r.classIndex >= 0 && r.classIndex < _labels.length) {
+      return _labels[r.classIndex];
+    }
+    return name.isEmpty && r.classIndex >= 0 && r.classIndex < _labels.length
+        ? _labels[r.classIndex]
+        : (name.isEmpty ? 'class_${r.classIndex}' : name);
+  }
+
+  bool get _allLabelsPresent => _labels.isNotEmpty && _labels.every((l) => _latestByLabel.containsKey(l));
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = _modelFilePath != null;
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title), actions: [
+        if (!widget.showBoxesOnly)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Center(
+              child: Text(
+                _allLabelsPresent ? 'Ready' : 'Align card…',
+                style: TextStyle(color: _allLabelsPresent ? Colors.green : Colors.orange),
+              ),
+            ),
+          ),
+      ]),
+      body: !ready
+          ? const Center(child: Text('Preparing model…'))
+          : LayoutBuilder(builder: (context, constraints) {
+              final screenSize = Size(constraints.maxWidth, constraints.maxHeight);
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  RepaintBoundary(
+                    key: _boundaryKey,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        YOLOView(
+                          modelPath: _modelFilePath!,
+                          task: YOLOTask.detect,
+                          controller: _controller,
+                          showNativeUI: false,
+                          useGpu: true,
+                          confidenceThreshold: 0.60,
+                          iouThreshold: 0.50,
+                          streamingConfig: const YOLOStreamingConfig.minimal(),
+                          onResult: (List<YOLOResult> results) {
+                            final listCopy = List<YOLOResult>.from(results);
+                            setState(() {
+                              _results = listCopy;
+                              _latestByLabel = {
+                                for (final r in listCopy)
+                                  if (_labels.contains(_displayName(r))) _displayName(r): r,
+                              };
+                            });
+                          },
+                          onStreamingData: (stream) {
+                            try {
+                              final dets = (stream['detections'] as List?) ?? const [];
+                              final parsed = dets.whereType<Map>().map((m) => YOLOResult.fromMap(m)).toList();
+                              setState(() {
+                                _fps = (stream['fps'] is num) ? (stream['fps'] as num).toDouble() : _fps;
+                                _results = parsed;
+                                _latestByLabel = {
+                                  for (final r in parsed)
+                                    if (_labels.contains(_displayName(r))) _displayName(r): r,
+                                };
+                              });
+                            } catch (_) {}
+                          },
+                        ),
+                        CustomPaint(
+                          painter: _BoxesOnlyPainter(
+                            results: _results,
+                            screenSize: screenSize,
+                            nameFor: _displayName,
+                            drawLabels: !widget.showBoxesOnly,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (!widget.showBoxesOnly)
+                    Positioned(
+                      bottom: 20,
+                      left: 16,
+                      right: 16,
+                      child: SafeArea(
+                        top: false,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: FilledButton(
+                                onPressed: (_allLabelsPresent && !_saving) ? _captureAndSave : null,
+                                child: _saving ? const Text('Saving…') : const Text('Capture'),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.45),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                _fps != null ? 'FPS ${_fps!.toStringAsFixed(1)}' : '—',
+                                style: const TextStyle(color: Colors.white),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            }),
+    );
+  }
+
+  Future<void> _captureAndSave() async {
+    try {
+      setState(() => _saving = true);
+      final boundary = _boundaryKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) throw Exception('No boundary');
+      final dpr = MediaQuery.of(context).devicePixelRatio;
+      final ui.Image image = await boundary.toImage(pixelRatio: dpr);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) throw Exception('No image bytes');
+      var bytes = byteData.buffer.asUint8List();
+
+      final cardLabel = _labels.firstWhere(
+        (l) => l.toLowerCase().contains('_image'),
+        orElse: () => '',
+      );
+      if (cardLabel.isNotEmpty && _latestByLabel[cardLabel] != null) {
+        final r = _latestByLabel[cardLabel]!;
+        final nb = r.normalizedBox;
+        final imgDecoded = img.decodeImage(bytes);
+        if (imgDecoded != null) {
+          final iw = imgDecoded.width;
+          final ih = imgDecoded.height;
+          final x = (nb.left * iw).clamp(0, iw - 1).toInt();
+          final y = (nb.top * ih).clamp(0, ih - 1).toInt();
+          final w = (nb.width * iw).clamp(1, iw - x).toInt();
+          final h = (nb.height * ih).clamp(1, ih - y).toInt();
+          final cropped = img.copyCrop(imgDecoded, x: x, y: y, width: w, height: h);
+          bytes = img.encodePng(cropped);
+        }
+      }
+
+      final dir = await getTemporaryDirectory();
+      final side = widget.labelsAssetPath.contains('back') ? 'back' : 'front';
+      final file = File('${dir.path}/nid_${side}_${DateTime.now().millisecondsSinceEpoch}.png');
+      await file.writeAsBytes(bytes);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved: ${file.path}')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Capture failed: $e')));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+}
+
+class _BoxesOnlyPainter extends CustomPainter {
+  final List<YOLOResult> results;
+  final Size screenSize;
+  final String Function(YOLOResult) nameFor;
+  final bool drawLabels;
+  _BoxesOnlyPainter({required this.results, required this.screenSize, required this.nameFor, this.drawLabels = true});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..color = Colors.tealAccent;
+    final textPainter = TextPainter(textDirection: TextDirection.ltr);
+
+    for (final r in results) {
+      final nb = r.normalizedBox;
+      final rect = Rect.fromLTWH(nb.left * size.width, nb.top * size.height, nb.width * size.width, nb.height * size.height);
+      canvas.drawRect(rect, paint);
+      if (drawLabels) {
+        final label = '${nameFor(r)} ${(r.confidence * 100).toStringAsFixed(0)}%';
+        textPainter.text = TextSpan(text: label, style: const TextStyle(color: Colors.white, fontSize: 12));
+        textPainter.layout();
+        final tp = Offset(rect.left, math.max(0, rect.top - textPainter.height - 2));
+        final bgRect = Rect.fromLTWH(tp.dx - 2, tp.dy - 2, textPainter.width + 4, textPainter.height + 4);
+        final bgPaint = Paint()..color = Colors.black.withValues(alpha: 0.55);
+        canvas.drawRRect(RRect.fromRectAndRadius(bgRect, const Radius.circular(4)), bgPaint);
+        textPainter.paint(canvas, tp);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _BoxesOnlyPainter oldDelegate) =>
+      oldDelegate.results != results || oldDelegate.drawLabels != drawLabels || oldDelegate.screenSize != screenSize;
 }
