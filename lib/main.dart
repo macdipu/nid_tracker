@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:ultralytics_yolo/yolo.dart' as yolo_single;
 import 'package:ultralytics_yolo/yolo_result.dart';
 import 'package:ultralytics_yolo/yolo_task.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
@@ -24,7 +23,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'NID Front Detector',
+      title: 'NID Detector',
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
       home: const NidLiveDetectPage(),
     );
@@ -47,23 +46,23 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
   // Absolute model file path copied from assets
   String? _modelFilePath;
 
-  // Labels loaded from assets/labels.txt (optional)
+  // Labels loaded from assets/labels.txt
   List<String> _labels = const [];
   bool _labelsLoaded = false;
   double? _fps;
   int _lastEventMs = 0;
 
-  static const List<String> kTargetLabels = [
-    'dob',
-    'father_name',
-    'image',
-    'mother_name',
-    'name',
-    'name_bn',
-    'nid_front_image',
-    'nid_no',
-    'signature',
-  ];
+  // static const List<String> _labels = [
+  //   'dob',
+  //   'father_name',
+  //   'image',
+  //   'mother_name',
+  //   'name',
+  //   'name_bn',
+  //   'nid_front_image',
+  //   'nid_no',
+  //   'signature',
+  // ];
 
   @override
   void initState() {
@@ -102,7 +101,17 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
     try {
       final txt = await rootBundle.loadString('assets/labels.txt');
       final lines = txt.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
-      if (mounted) setState(() { _labels = lines; _labelsLoaded = true; });
+      if (mounted) {
+        setState(() {
+          _labels = lines;
+          _labelsLoaded = true;
+          // Recompute latest detections mapped by label using current _results
+          _latestByLabel = {
+            for (final r in _results)
+              if (_labels.contains(_displayName(r))) _displayName(r): r,
+          };
+        });
+      }
     } catch (_) {
       // ignore if labels not present
     }
@@ -119,39 +128,6 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
         : (name.isEmpty ? 'class_${r.classIndex}' : name);
   }
 
-  Future<void> _debugSingleImagePredict() async {
-    try {
-      final path = _modelFilePath ?? 'assets/model.tflite';
-      final check = await yolo_single.YOLO.checkModelExists(path);
-      final y = yolo_single.YOLO(modelPath: path, task: YOLOTask.detect);
-      await y.loadModel();
-      final data = await rootBundle.load('assets/nid_front.png');
-      final bytes = data.buffer.asUint8List();
-      final res = await y.predict(bytes, confidenceThreshold: 0.25, iouThreshold: 0.50);
-      final boxes = (res['boxes'] as List?)?.cast<Map>() ?? const [];
-      // Collect names
-      final names = <String>[];
-      for (final b in boxes.take(5)) {
-        final m = Map<String, dynamic>.from(b as Map);
-        final name = (m['className'] ?? m['class'] ?? 'unknown').toString();
-        final ci = m['classIndex'];
-        final disp = (name.isEmpty || name == 'unknown') && ci is int && ci >= 0 && ci < _labels.length
-            ? _labels[ci]
-            : name;
-        names.add(disp);
-      }
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Model exists: ${check['exists']} • Boxes: ${boxes.length} • First: ${names.join(', ')}')),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Single-image predict failed: $e')),
-      );
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final ready = _modelFilePath != null; // wait until model file is ready
@@ -159,11 +135,6 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
       appBar: AppBar(
         title: const Text('NID Front - Live Detection'),
         actions: [
-          IconButton(
-            tooltip: 'Run single-image debug',
-            icon: const Icon(Icons.image_search),
-            onPressed: _debugSingleImagePredict,
-          ),
           IconButton(
             tooltip: 'Switch camera',
             icon: const Icon(Icons.cameraswitch),
@@ -191,12 +162,14 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
                 streamingConfig: const YOLOStreamingConfig.minimal(),
                 onResult: (List<YOLOResult> results) {
                   final now = DateTime.now().millisecondsSinceEpoch;
+                  // Make a fresh copy to force painter repaint comparisons
+                  final listCopy = List<YOLOResult>.from(results);
                   setState(() {
                     _lastEventMs = now;
-                    _results = results;
+                    _results = listCopy;
                     _latestByLabel = {
-                      for (final r in results)
-                        if (kTargetLabels.contains(_displayName(r))) _displayName(r): r,
+                      for (final r in listCopy)
+                        if (_labels.contains(_displayName(r))) _displayName(r): r,
                     };
                   });
                 },
@@ -209,10 +182,10 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
                     setState(() {
                       _lastEventMs = now;
                       _fps = (stream['fps'] is num) ? (stream['fps'] as num).toDouble() : _fps;
-                      _results = parsed;
+                      _results = parsed; // already a fresh list
                       _latestByLabel = {
                         for (final r in parsed)
-                          if (kTargetLabels.contains(_displayName(r))) _displayName(r): r,
+                          if (_labels.contains(_displayName(r))) _displayName(r): r,
                       };
                     });
                   } catch (_) {/*ignore parse errors*/}
@@ -286,7 +259,7 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  for (final key in kTargetLabels)
+                  for (final key in _labels)
                     _FieldChip(
                       label: key,
                       value: _latestByLabel[key]?.confidence != null
@@ -304,8 +277,9 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
   }
 
   Color _colorForLabel(String label) {
-    final idx = kTargetLabels.indexOf(label);
-    final hue = (idx / kTargetLabels.length) * 360.0;
+    if (_labels.isEmpty) return Colors.grey;
+    final idx = _labels.indexOf(label);
+    final hue = (idx / _labels.length) * 360.0;
     return HSLColor.fromAHSL(1.0, hue, 0.8, 0.5).toColor();
   }
 }
