@@ -39,6 +39,7 @@ dependencies:
   image: ^4.5.4
   ultralytics_yolo: ^0.1.36
   path_provider: ^2.1.5
+  gal: ^2.3.0
 
 dev_dependencies:
   flutter_test:

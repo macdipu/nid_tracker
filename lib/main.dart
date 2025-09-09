@@ -10,6 +10,7 @@ import 'package:ultralytics_yolo/yolo_task.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import 'package:ultralytics_yolo/yolo_streaming_config.dart';
 import 'package:image/image.dart' as img;
+import 'package:gal/gal.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -555,15 +556,28 @@ class _NidCapturePageState extends State<NidCapturePage> {
   Map<String, YOLOResult> _latestByLabel = {};
   double? _fps;
   bool _saving = false;
+  String? _targetLabel;
 
   @override
   void initState() {
     super.initState();
+    _resolveTargetLabel();
     _prepareModelPath();
     _loadLabels();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _controller.setThresholds(confidenceThreshold: 0.60, iouThreshold: 0.50, numItemsThreshold: 100);
     });
+  }
+
+  void _resolveTargetLabel() {
+    final p = widget.labelsAssetPath.toLowerCase();
+    if (p.contains('front')) {
+      _targetLabel = 'nid_front_image';
+    } else if (p.contains('back')) {
+      _targetLabel = 'nid_back';
+    } else {
+      _targetLabel = null;
+    }
   }
 
   Future<void> _prepareModelPath() async {
@@ -588,7 +602,15 @@ class _NidCapturePageState extends State<NidCapturePage> {
     try {
       final txt = await rootBundle.loadString(widget.labelsAssetPath);
       final lines = txt.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
-      if (mounted) setState(() { _labels = lines; _labelsLoaded = true; });
+      if (mounted) setState(() {
+        _labels = lines;
+        _labelsLoaded = true;
+        // Fallback target if not resolved from path
+        _targetLabel ??= _labels.firstWhere(
+          (l) => l.toLowerCase().contains('_image'),
+          orElse: () => (_labels.firstWhere((l) => l.toLowerCase().contains('nid'), orElse: () => _labels.first)),
+        );
+      });
     } catch (_) {}
   }
 
@@ -672,7 +694,8 @@ class _NidCapturePageState extends State<NidCapturePage> {
                             results: _results,
                             screenSize: screenSize,
                             nameFor: _displayName,
-                            drawLabels: !widget.showBoxesOnly,
+                            drawLabels: false, // always boxes only
+                            filterLabel: _targetLabel,
                           ),
                         ),
                       ],
@@ -726,32 +749,51 @@ class _NidCapturePageState extends State<NidCapturePage> {
       if (byteData == null) throw Exception('No image bytes');
       var bytes = byteData.buffer.asUint8List();
 
-      final cardLabel = _labels.firstWhere(
-        (l) => l.toLowerCase().contains('_image'),
-        orElse: () => '',
-      );
-      if (cardLabel.isNotEmpty && _latestByLabel[cardLabel] != null) {
-        final r = _latestByLabel[cardLabel]!;
+      // Prefer target label; fallback to *_image if missing
+      String? cropLabel = _targetLabel;
+      if (cropLabel == null || !_latestByLabel.containsKey(cropLabel)) {
+        cropLabel = _labels.firstWhere(
+          (l) => l.toLowerCase().contains('_image'),
+          orElse: () => '',
+        );
+        if (cropLabel.isEmpty) cropLabel = null;
+      }
+
+      if (cropLabel != null && _latestByLabel[cropLabel] != null) {
+        final r = _latestByLabel[cropLabel]!;
         final nb = r.normalizedBox;
-        final imgDecoded = img.decodeImage(bytes);
-        if (imgDecoded != null) {
-          final iw = imgDecoded.width;
-          final ih = imgDecoded.height;
+        final decoded = img.decodeImage(bytes);
+        if (decoded != null) {
+          final iw = decoded.width;
+          final ih = decoded.height;
           final x = (nb.left * iw).clamp(0, iw - 1).toInt();
           final y = (nb.top * ih).clamp(0, ih - 1).toInt();
           final w = (nb.width * iw).clamp(1, iw - x).toInt();
           final h = (nb.height * ih).clamp(1, ih - y).toInt();
-          final cropped = img.copyCrop(imgDecoded, x: x, y: y, width: w, height: h);
+          final cropped = img.copyCrop(decoded, x: x, y: y, width: w, height: h);
           bytes = img.encodePng(cropped);
         }
       }
 
+      // Save PNG to a temp file (optional helper for debugging)
       final dir = await getTemporaryDirectory();
-      final side = widget.labelsAssetPath.contains('back') ? 'back' : 'front';
+      final side = widget.labelsAssetPath.toLowerCase().contains('back') ? 'back' : 'front';
       final file = File('${dir.path}/nid_${side}_${DateTime.now().millisecondsSinceEpoch}.png');
       await file.writeAsBytes(bytes);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved: ${file.path}')));
+
+      // Request gallery access if needed and save to Photos/Gallery
+      bool hasAccess = await Gal.hasAccess();
+      if (!hasAccess) {
+        hasAccess = await Gal.requestAccess();
+      }
+      if (hasAccess) {
+        await Gal.putImageBytes(bytes, album: 'NID Tracker');
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved to Gallery (NID Tracker)')));
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gallery permission denied. Temp: ${file.path}')));
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Capture failed: $e')));
@@ -766,7 +808,8 @@ class _BoxesOnlyPainter extends CustomPainter {
   final Size screenSize;
   final String Function(YOLOResult) nameFor;
   final bool drawLabels;
-  _BoxesOnlyPainter({required this.results, required this.screenSize, required this.nameFor, this.drawLabels = true});
+  final String? filterLabel;
+  _BoxesOnlyPainter({required this.results, required this.screenSize, required this.nameFor, this.drawLabels = true, this.filterLabel});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -777,11 +820,13 @@ class _BoxesOnlyPainter extends CustomPainter {
     final textPainter = TextPainter(textDirection: TextDirection.ltr);
 
     for (final r in results) {
+      final className = nameFor(r);
+      if (filterLabel != null && className != filterLabel) continue;
       final nb = r.normalizedBox;
       final rect = Rect.fromLTWH(nb.left * size.width, nb.top * size.height, nb.width * size.width, nb.height * size.height);
       canvas.drawRect(rect, paint);
       if (drawLabels) {
-        final label = '${nameFor(r)} ${(r.confidence * 100).toStringAsFixed(0)}%';
+        final label = '$className ${(r.confidence * 100).toStringAsFixed(0)}%';
         textPainter.text = TextSpan(text: label, style: const TextStyle(color: Colors.white, fontSize: 12));
         textPainter.layout();
         final tp = Offset(rect.left, math.max(0, rect.top - textPainter.height - 2));
@@ -795,5 +840,5 @@ class _BoxesOnlyPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _BoxesOnlyPainter oldDelegate) =>
-      oldDelegate.results != results || oldDelegate.drawLabels != drawLabels || oldDelegate.screenSize != screenSize;
+      oldDelegate.results != results || oldDelegate.drawLabels != drawLabels || oldDelegate.screenSize != screenSize || oldDelegate.filterLabel != filterLabel;
 }
