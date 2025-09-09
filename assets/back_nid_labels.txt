@@ -1,0 +1,8 @@
+address
+barcode
+blood_group
+expired_at
+issue_date
+mrz
+nid_back
+place_of_birth

@@ -25,13 +25,79 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'NID Detector',
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-      home: const NidLiveDetectPage(),
+      home: const HomePage(),
+    );
+  }
+}
+
+class HomePage extends StatelessWidget {
+  const HomePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('NID Tracker')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 280,
+                child: FilledButton(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const NidLiveDetectPage(
+                          title: 'NID Front - Live Detection',
+                          modelAssetPath: 'assets/front_nid_model.tflite',
+                          labelsAssetPath: 'assets/front_nid_labels.txt',
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text('Open NID Front Detector'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: 280,
+                child: OutlinedButton(
+                  onPressed: () {
+                    // Example for reusing with a different model/labels.
+                    // Update the asset paths once you add the back model files to pubspec assets.
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const NidLiveDetectPage(
+                          title: 'NID Back - Live Detection',
+                          modelAssetPath: 'assets/back_nid_model.tflite',
+                          labelsAssetPath: 'assets/front_nid_labels.txt',
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text('Open NID Back Detector'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
 
 class NidLiveDetectPage extends StatefulWidget {
-  const NidLiveDetectPage({super.key});
+  final String title;
+  final String modelAssetPath;
+  final String labelsAssetPath;
+  const NidLiveDetectPage({
+    super.key,
+    required this.title,
+    required this.modelAssetPath,
+    required this.labelsAssetPath,
+  });
 
   @override
   State<NidLiveDetectPage> createState() => _NidLiveDetectPageState();
@@ -52,18 +118,6 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
   double? _fps;
   int _lastEventMs = 0;
 
-  // static const List<String> _labels = [
-  //   'dob',
-  //   'father_name',
-  //   'image',
-  //   'mother_name',
-  //   'name',
-  //   'name_bn',
-  //   'nid_front_image',
-  //   'nid_no',
-  //   'signature',
-  // ];
-
   @override
   void initState() {
     super.initState();
@@ -82,9 +136,10 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
       if (!await modelsDir.exists()) {
         await modelsDir.create(recursive: true);
       }
-      final outFile = File('${modelsDir.path}/model.tflite');
-      // Always copy on first run; overwrite if file missing or zero sized
-      final data = await rootBundle.load('assets/model.tflite');
+      final baseName = widget.modelAssetPath.split('/').last;
+      final outFile = File('${modelsDir.path}/$baseName');
+      // Always copy on first run; overwrite if file missing or size differs
+      final data = await rootBundle.load(widget.modelAssetPath);
       if (!await outFile.exists() || (await outFile.length()) != data.lengthInBytes) {
         await outFile.writeAsBytes(data.buffer.asUint8List(), flush: true);
       }
@@ -99,7 +154,7 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
 
   Future<void> _loadLabels() async {
     try {
-      final txt = await rootBundle.loadString('assets/labels.txt');
+      final txt = await rootBundle.loadString(widget.labelsAssetPath);
       final lines = txt.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
       if (mounted) {
         setState(() {
@@ -133,7 +188,7 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
     final ready = _modelFilePath != null; // wait until model file is ready
     return Scaffold(
       appBar: AppBar(
-        title: const Text('NID Front - Live Detection'),
+        title: Text(widget.title),
         actions: [
           IconButton(
             tooltip: 'Switch camera',
@@ -197,7 +252,12 @@ class _NidLiveDetectPageState extends State<NidLiveDetectPage> {
               ),
               // Our overlay for custom styling/colors and summary chips
               CustomPaint(
-                painter: _ResultsPainter(results: _results, screenSize: screenSize, nameFor: _displayName),
+                painter: _ResultsPainter(
+                  results: _results,
+                  screenSize: screenSize,
+                  nameFor: _displayName,
+                  colorForLabel: _colorForLabel,
+                ),
               ),
               // Status banner (FPS / No detections yet)
               Positioned(
@@ -288,8 +348,14 @@ class _ResultsPainter extends CustomPainter {
   final List<YOLOResult> results;
   final Size screenSize;
   final String Function(YOLOResult) nameFor;
+  final Color Function(String) colorForLabel;
 
-  _ResultsPainter({required this.results, required this.screenSize, required this.nameFor});
+  _ResultsPainter({
+    required this.results,
+    required this.screenSize,
+    required this.nameFor,
+    required this.colorForLabel,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -300,7 +366,7 @@ class _ResultsPainter extends CustomPainter {
 
     for (final r in results) {
       final className = nameFor(r);
-      final color = _colorFromLabel(className);
+      final color = colorForLabel(className);
       paint.color = color;
 
       final nb = r.normalizedBox;
@@ -329,24 +395,7 @@ class _ResultsPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ResultsPainter oldDelegate) {
-    return oldDelegate.results != results || oldDelegate.screenSize != screenSize || oldDelegate.nameFor != nameFor;
-  }
-
-  Color _colorFromLabel(String label) {
-    const labels = [
-      'dob',
-      'father_name',
-      'image',
-      'mother_name',
-      'name',
-      'name_bn',
-      'nid_front_image',
-      'nid_no',
-      'signature',
-    ];
-    final idx = math.max(0, labels.indexOf(label));
-    final hue = (idx / labels.length) * 360.0;
-    return HSLColor.fromAHSL(1.0, hue, 0.8, 0.5).toColor();
+    return oldDelegate.results != results || oldDelegate.screenSize != screenSize || oldDelegate.nameFor != nameFor || oldDelegate.colorForLabel != colorForLabel;
   }
 }
 
